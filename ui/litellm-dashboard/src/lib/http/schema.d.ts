@@ -32076,7 +32076,7 @@ export interface components {
             classifier_context_window_size: number;
             /**
              * Classifier Fallback
-             * @description What classifies the request when the LLM classifier errors, times out, or returns an unparseable response. 'heuristic' runs the local complexity scorer, which is right when the classifier grades complexity too. 'default_model' skips scoring and routes to default_model, which is what a classifier on some other taxonomy wants: a prompt that grades data sensitivity has no use for a complexity score, and scoring one produces a tier unrelated to what the operator configured. Requires default_model when set to 'default_model'. Only applies when classifier_type is 'llm' or 'plugin'.
+             * @description What classifies the request when the LLM classifier errors, times out, or returns an unparseable response. 'heuristic' runs the local complexity scorer, which is right when the classifier grades complexity too. 'default_model' skips scoring and routes to default_model, which is what a classifier on some other taxonomy wants: a prompt that grades data sensitivity has no use for a complexity score, and scoring one produces a tier unrelated to what the operator configured. Requires default_model when set to 'default_model'. Only applies when classifier_type is 'llm' or 'custom'.
              * @default heuristic
              * @enum {string}
              */
@@ -32090,7 +32090,7 @@ export interface components {
             classifier_plugin?: null;
             /**
              * Classifier Plugin Timeout Ms
-             * @description Timeout budget for the classifier plugin call, in milliseconds. On expiry the fallback path decides the tier. Only applies when classifier_type is 'plugin'.
+             * @description Timeout budget for the classifier plugin call, in milliseconds. On expiry the fallback path decides the tier. Only applies when classifier_type is 'custom'.
              * @default 3000
              */
             classifier_plugin_timeout_ms: number;
@@ -32100,7 +32100,7 @@ export interface components {
              * @default heuristic
              * @enum {string}
              */
-            classifier_type: "heuristic" | "llm" | "plugin";
+            classifier_type: "heuristic" | "llm" | "custom";
             /**
              * Code Keywords
              * @description Keywords indicating code-related content
@@ -32213,7 +32213,7 @@ export interface components {
             };
             /**
              * Tier Definitions
-             * @description Operator-defined tier set replacing the built-in SIMPLE/MEDIUM/COMPLEX/REASONING. Each entry's name becomes a value the LLM classifier can return and its description becomes that tier's rubric bullet; entries named after a built-in tier may omit the description and inherit the built-in criteria. List order is ascending severity and decides which tier wins when several keyword_tier_rules match. Requires classifier_type 'llm' or 'plugin', a fallback_tier, and `tiers` keys matching the defined names exactly. Escalation, adaptive selection, session affinity, plugins, tier_labels, and the calibration-example rubric presets are unavailable with a custom tier set: the first four are built on the built-in tier ladder, and the last two rename or exemplify tiers the set replaces.
+             * @description Operator-defined tier set replacing the built-in SIMPLE/MEDIUM/COMPLEX/REASONING. Each entry's name becomes a value the LLM classifier can return and its description becomes that tier's rubric bullet; entries named after a built-in tier may omit the description and inherit the built-in criteria. List order is ascending severity and decides which tier wins when several keyword_tier_rules match. Requires classifier_type 'llm' or 'custom', a fallback_tier, and `tiers` keys matching the defined names exactly. Escalation, adaptive selection, session affinity, plugins, tier_labels, and the calibration-example rubric presets are unavailable with a custom tier set: the first four are built on the built-in tier ladder, and the last two rename or exemplify tiers the set replaces.
              */
             tier_definitions?: components["schemas"]["TierDefinition"][] | null;
             /**
