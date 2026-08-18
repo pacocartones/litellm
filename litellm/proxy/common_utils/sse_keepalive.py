@@ -1,15 +1,22 @@
 import asyncio
 import contextlib
 import math
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Final
 
 import anyio
 
 ANTHROPIC_PING_SSE_CHUNK: Final = 'event: ping\ndata: {"type": "ping"}\n\n'
+SSE_COMMENT_PING_BYTES: Final = b": ping\n\n"
+# The byte form of proxy_server._SSE_FRAME_DELIMITERS, CR-only included: SSE
+# terminates a line with CRLF, LF or CR, so a blank line is any of these three.
+_SSE_FRAME_DELIMITERS: Final = (b"\r\n\r\n", b"\n\n", b"\r\r")
+_SSE_DELIMITER_LOOKBACK: Final = max(len(delimiter) for delimiter in _SSE_FRAME_DELIMITERS)
+_STREAM_START_TAIL: Final = b"\n\n"
+_SSE_MEDIA_TYPE: Final = "text/event-stream"
 
 
-def _coerce_interval(ping_interval_seconds: float | str | None) -> float | None:
+def coerce_keepalive_interval(ping_interval_seconds: float | str | None) -> float | None:
     if ping_interval_seconds is None:
         return None
     try:
@@ -28,7 +35,7 @@ def keepalive_ping_has_fired(elapsed_seconds: float, ping_interval_seconds: floa
     the status line is already on the wire. With pings disabled nothing flushes early, so a raise
     still carries its real status.
     """
-    interval: Final = _coerce_interval(ping_interval_seconds)
+    interval: Final = coerce_keepalive_interval(ping_interval_seconds)
     return interval is not None and elapsed_seconds >= interval
 
 
@@ -36,7 +43,7 @@ def wrap_sse_stream_with_keepalive_pings(
     stream: AsyncGenerator[str, None],
     ping_interval_seconds: float | str | None,
 ) -> AsyncGenerator[str, None]:
-    interval: Final = _coerce_interval(ping_interval_seconds)
+    interval: Final = coerce_keepalive_interval(ping_interval_seconds)
     if interval is None:
         return stream
     return _keepalive_ping_stream(stream=stream, ping_interval_seconds=interval)
@@ -59,6 +66,67 @@ async def _keepalive_ping_stream(
                 yield pending.result()
             except StopAsyncIteration:
                 return
+            pending = asyncio.ensure_future(stream.__anext__())
+    finally:
+        pending.cancel()
+        with anyio.CancelScope(shield=True):
+            with contextlib.suppress(BaseException):
+                await pending
+            await stream.aclose()
+
+
+def is_sse_content_type(content_type: str | None) -> bool:
+    return content_type is not None and content_type.split(";", 1)[0].strip().lower() == _SSE_MEDIA_TYPE
+
+
+def wrap_passthrough_sse_bytes_with_keepalive_pings(
+    stream: AsyncGenerator[bytes, None],
+    ping_interval_seconds: float | str | None,
+    upstream_headers: Mapping[str, str],
+) -> AsyncGenerator[bytes, None]:
+    """Fill upstream silence on a byte-relaying passthrough stream with SSE comments.
+
+    Passthrough routes relay upstream bytes verbatim, so a model that thinks for
+    longer than an intermediary's idle read timeout has its connection dropped
+    before the first token. Only streams the upstream itself declares as
+    ``text/event-stream`` are wrapped: a comment spliced into a binary transport
+    (AWS event streams on ``/bedrock``, protobuf, NDJSON) would corrupt it.
+    """
+    interval: Final = coerce_keepalive_interval(ping_interval_seconds)
+    if interval is None or not is_sse_content_type(upstream_headers.get("content-type")):
+        return stream
+    return _keepalive_ping_byte_stream(stream=stream, ping_interval_seconds=interval)
+
+
+async def _keepalive_ping_byte_stream(
+    stream: AsyncGenerator[bytes, None],
+    ping_interval_seconds: float,
+) -> AsyncGenerator[bytes, None]:
+    pending = asyncio.ensure_future(
+        stream.__anext__()
+    )  # rebind-ok: re-armed with the next __anext__ after each delivered chunk
+    # The tail of the bytes relayed so far, long enough to hold any delimiter.
+    # Seeded as a delimiter because a stream starts at a frame boundary, and kept
+    # across chunks because a delimiter can be split between two transport reads,
+    # which testing only the latest chunk would miss for the rest of the stream.
+    recent_tail = _STREAM_START_TAIL  # rebind-ok: rolling window over the relayed bytes
+    try:
+        while True:
+            await asyncio.wait((pending,), timeout=ping_interval_seconds)
+            if not pending.done():
+                # The relayed chunks are raw transport reads, not whole SSE
+                # frames, so an upstream that stalls halfway through a frame
+                # must not have a comment spliced into it.
+                if recent_tail.endswith(_SSE_FRAME_DELIMITERS):
+                    yield SSE_COMMENT_PING_BYTES
+                continue
+            try:
+                chunk: bytes = pending.result()
+            except StopAsyncIteration:
+                return
+            if chunk:
+                recent_tail = (recent_tail + chunk)[-_SSE_DELIMITER_LOOKBACK:]
+            yield chunk
             pending = asyncio.ensure_future(stream.__anext__())
     finally:
         pending.cancel()

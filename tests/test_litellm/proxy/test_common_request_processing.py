@@ -28,6 +28,9 @@ from litellm.proxy.common_request_processing import (
     _get_cost_breakdown_from_logging_obj,
     _has_attribute_error_in_chain,
     _is_azure_model_router_request,
+    _UpstreamClosingStreamingResponse,
+    open_sse_before_first_byte,
+    ttft_keepalive_interval,
     _override_openai_response_model,
     _parse_event_data_for_error,
     _resolve_per_request_model_group_alias,
@@ -6057,3 +6060,274 @@ class TestProcessChunkWithCostInjection:
         )
 
         assert ProxyBaseLLMRequestProcessing._process_chunk_with_cost_injection(chunk, "gpt-4o-mini") == chunk
+
+
+# ---------------------------------------------------------------------------
+# SSE keepalive during the time-to-first-token (issue #34819)
+# ---------------------------------------------------------------------------
+
+TTFT_PING = b": ping\n\n"
+
+
+async def _drain(response):
+    return [chunk async for chunk in response.body_iterator]
+
+
+def _sse_response(chunks, upstream_generator=None):
+    async def gen():
+        for chunk in chunks:
+            yield chunk
+
+    if upstream_generator is None:
+        return StreamingResponse(gen(), media_type="text/event-stream")
+    return _UpstreamClosingStreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        upstream_generator=upstream_generator,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ttft_keepalive_fills_the_wire_while_the_upstream_is_still_silent():
+    """Regression for #34819. The upstream withholds its headers until the first
+    token, so the whole wait happens before a byte can be written and an
+    idle-timeout hop drops a healthy connection."""
+
+    async def slow_upstream():
+        await asyncio.sleep(0.35)
+        return _sse_response(['data: {"first": true}\n\n'])
+
+    response = await open_sse_before_first_byte(slow_upstream(), ping_interval_seconds=0.05)
+
+    assert isinstance(response, StreamingResponse)
+    assert response.headers["x-accel-buffering"] == "no"
+    collected = await _drain(response)
+    assert collected[0] == TTFT_PING
+    assert collected.count(TTFT_PING) >= 3
+    assert collected[-1] == b'data: {"first": true}\n\n'
+
+
+@pytest.mark.asyncio
+async def test_ttft_keepalive_is_a_no_op_when_the_upstream_answers_in_time():
+    produced = _sse_response(['data: {"fast": true}\n\n'])
+
+    async def fast_upstream():
+        return produced
+
+    response = await open_sse_before_first_byte(fast_upstream(), ping_interval_seconds=5.0)
+
+    assert response is produced
+    assert await _drain(response) == ['data: {"fast": true}\n\n']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", [None, 0, "", "abc", float("inf"), float("nan"), -1])
+async def test_ttft_keepalive_unconfigured_leaves_the_call_completely_untouched(interval):
+    produced = _sse_response(['data: {"x": 1}\n\n'])
+    started_at = asyncio.get_running_loop().time()
+
+    async def slow_upstream():
+        await asyncio.sleep(0.15)
+        return produced
+
+    response = await open_sse_before_first_byte(slow_upstream(), ping_interval_seconds=interval)
+
+    assert response is produced
+    assert asyncio.get_running_loop().time() - started_at >= 0.15
+
+
+@pytest.mark.asyncio
+async def test_ttft_keepalive_reraises_a_fast_failure_so_it_keeps_its_http_status():
+    async def fast_failure():
+        raise HTTPException(status_code=429, detail="rate limited")
+
+    with pytest.raises(HTTPException) as excinfo:
+        await open_sse_before_first_byte(fast_failure(), ping_interval_seconds=5.0)
+
+    assert excinfo.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_ttft_keepalive_delivers_a_late_failure_as_an_sse_frame():
+    """Once a ping is on the wire the status line is committed, so a failure
+    discovered afterwards can only reach the client as a frame."""
+
+    async def slow_failure():
+        await asyncio.sleep(0.2)
+        raise HTTPException(status_code=429, detail="rate limited")
+
+    response = await open_sse_before_first_byte(slow_failure(), ping_interval_seconds=0.05)
+    collected = await _drain(response)
+
+    assert collected[0] == TTFT_PING
+    assert collected[-1] == b"data: [DONE]\n\n"
+    error_frame = json.loads(collected[-2].decode().removeprefix("data: ").strip())
+    assert error_frame["error"]["code"] == "429"
+    assert error_frame["error"]["message"] == "rate limited"
+
+
+@pytest.mark.asyncio
+async def test_ttft_keepalive_relays_a_late_non_streaming_body_as_an_sse_frame():
+    async def slow_json():
+        await asyncio.sleep(0.2)
+        return JSONResponse(status_code=400, content={"error": {"message": "bad request"}})
+
+    response = await open_sse_before_first_byte(slow_json(), ping_interval_seconds=0.05)
+    collected = await _drain(response)
+
+    assert collected[0] == TTFT_PING
+    assert json.loads(collected[-2].decode().removeprefix("data: ").strip()) == {"error": {"message": "bad request"}}
+    assert collected[-1] == b"data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_ttft_keepalive_closes_the_upstream_stream_it_relayed():
+    """Starlette never calls the produced response, so its own cleanup never runs
+    and the upstream LLM connection would leak."""
+    upstream_closed = asyncio.Event()
+
+    async def upstream():
+        try:
+            yield 'data: {"a": 1}\n\n'
+        finally:
+            upstream_closed.set()
+
+    upstream_gen = upstream()
+    # Started, as create_response leaves it: aclose() on a never-started generator
+    # skips its body, so an unstarted fixture cannot tell cleanup from no cleanup.
+    await upstream_gen.__anext__()
+
+    async def slow_upstream():
+        await asyncio.sleep(0.2)
+        return _sse_response(['data: {"a": 1}\n\n'], upstream_generator=upstream_gen)
+
+    response = await open_sse_before_first_byte(slow_upstream(), ping_interval_seconds=0.05)
+    await _drain(response)
+
+    assert upstream_closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_ttft_keepalive_cancels_the_in_flight_call_when_the_client_gives_up():
+    upstream_cancelled = asyncio.Event()
+
+    async def never_answers():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            upstream_cancelled.set()
+            raise
+
+    response = await open_sse_before_first_byte(never_answers(), ping_interval_seconds=0.05)
+    assert await response.body_iterator.__anext__() == TTFT_PING
+    await response.body_iterator.aclose()
+    await asyncio.sleep(0)
+
+    assert upstream_cancelled.is_set()
+
+
+@pytest.mark.parametrize(
+    "request_data, global_interval, expected",
+    [
+        ({"stream": True}, 30.0, 30.0),
+        ({"stream": True}, None, None),
+        ({"stream": False}, 30.0, None),
+        ({}, 30.0, None),
+        ({"stream": "true"}, 30.0, None),
+    ],
+)
+def test_ttft_keepalive_interval_only_arms_for_a_streaming_request(request_data, global_interval, expected):
+    with patch.object(litellm, "sse_keepalive_ping_interval_seconds", global_interval):
+        assert ttft_keepalive_interval(request_data) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_requested, expect_ping", [(True, True), (False, False)])
+async def test_base_process_llm_request_pings_while_the_upstream_call_is_still_running(
+    stream_requested, expect_ping
+):
+    """The wiring, not the helper: every route funnels through this method, and the
+    whole time-to-first-token is spent inside the call it wraps."""
+
+    async def slow_inner(self, **kwargs):
+        await asyncio.sleep(0.25)
+        return _sse_response(['data: {"late": true}\n\n'])
+
+    processor = ProxyBaseLLMRequestProcessing(data={"model": "gpt-4o", "stream": stream_requested})
+
+    with patch.object(litellm, "sse_keepalive_ping_interval_seconds", 0.05):
+        with patch.object(ProxyBaseLLMRequestProcessing, "_process_llm_request", slow_inner):
+            response = await processor.base_process_llm_request(
+                request=MagicMock(spec=Request),
+                fastapi_response=Response(),
+                user_api_key_dict=MagicMock(spec=UserAPIKeyAuth),
+                route_type="acompletion",
+                proxy_logging_obj=MagicMock(spec=ProxyLogging),
+                general_settings={},
+                proxy_config=MagicMock(spec=ProxyConfig),
+            )
+
+    collected = await _drain(response)
+    assert (collected[0] == TTFT_PING) is expect_ping
+    assert collected[-1] == (b'data: {"late": true}\n\n' if expect_ping else 'data: {"late": true}\n\n')
+
+
+def _request_disconnecting_after(delay_seconds):
+    """A Request whose ASGI channel delivers one http.disconnect, then goes quiet."""
+    request = MagicMock(spec=Request)
+    delivered = {"done": False}
+
+    async def receive():
+        if delivered["done"]:
+            await asyncio.Event().wait()
+        await asyncio.sleep(delay_seconds)
+        delivered["done"] = True
+        return {"type": "http.disconnect"}
+
+    request.receive = receive
+    return request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "disconnect_after, expect_full_delivery",
+    [(0.25, False), (999.0, True)],
+)
+async def test_opening_the_response_early_still_closes_the_upstream_on_disconnect(
+    disconnect_after, expect_full_delivery
+):
+    """Once the response is opened early, create_response's own disconnect
+    monitoring runs while Starlette is already serving, so both read the same ASGI
+    channel. Whichever observes the disconnect, the upstream LLM stream must close.
+    """
+    upstream_closed = asyncio.Event()
+    delivered = []
+
+    async def upstream():
+        try:
+            await asyncio.sleep(0.4)
+            for chunk in ('data: {"a": 1}\n\n', "data: [DONE]\n\n"):
+                delivered.append(chunk)
+                yield chunk
+        finally:
+            upstream_closed.set()
+
+    request = _request_disconnecting_after(disconnect_after)
+
+    async def produce():
+        await asyncio.sleep(0.15)
+        return await create_response(
+            generator=upstream(),
+            media_type="text/event-stream",
+            headers={},
+            request=request,
+        )
+
+    response = await open_sse_before_first_byte(produce(), ping_interval_seconds=0.05)
+    collected = await _drain(response)
+    await asyncio.sleep(0.05)
+
+    assert collected[0] == TTFT_PING
+    assert upstream_closed.is_set()
+    # The control has to actually deliver, or "the upstream closed" proves nothing.
+    assert (delivered == ['data: {"a": 1}\n\n', "data: [DONE]\n\n"]) is expect_full_delivery
